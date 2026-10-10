@@ -1,6 +1,5 @@
 # Leisure-PA 16-metabolite score.
-# Select the seed by same-sample adjusted CRC OR; estimates are exploratory.
-# Run the selected-seed analysis once at the search endpoint.
+# Fit once with seed 257.
 
 # Resolve the package directory from source() or Rscript.
 .integration_code_root <- local({
@@ -57,136 +56,9 @@ if (.Platform$OS.type == "windows" && getRversion() >= "4.3.0" &&
   file.path(.integration_leisure, "forced_18_opposite_direction_56met_LASSO",
             "19g_VIF_18_forced_metabolites_plus_covariates.csv"))
 
-# 1. Search seeds 1-300.
-.integration_run_stage("code_seed_search_1_300.R",
-  file.path(.integration_leisure, "forced_15_seed1_300_min_fullmodel_OR"), {
-options(stringsAsFactors = FALSE)
-suppressPackageStartupMessages({
-  library(glmnet)
-  library(survival)
-})
-
-# Use package-local inputs and results.
-out_dir <- getwd()
-base_dir <- dirname(out_dir)
-quadrant_dir <- file.path(base_dir, "four_quadrant_plot_56_metabolites")
-previous_vif_dir <- file.path(base_dir, "forced_18_opposite_direction_56met_LASSO")
-
-quadrant <- read.csv(file.path(quadrant_dir, "01_quadrant_plot_data.csv"),
-                     check.names = FALSE, stringsAsFactors = FALSE)
-screen <- read.csv(file.path(base_dir, "02_Spearman_nominal_P_lt_0.05_full_nested.csv"),
-                   check.names = FALSE, stringsAsFactors = FALSE)
-obj <- readRDS(file.path(.integration_nested, "05_complete_analysis_objects.rds"))
-derivation <- obj$derivation_dat
-lag1 <- obj$lag1_dat
-previous_vif <- read.csv(file.path(previous_vif_dir,
-                          "19g_VIF_18_forced_metabolites_plus_covariates.csv"),
-                        check.names = FALSE, stringsAsFactors = FALSE)
-previous_vif <- subset(previous_vif,
-                       Predictor_set == "18 forced metabolites + covariates" & VIF >= 5)
-excluded <- previous_vif$Metabolite
-opposite <- (quadrant$Spearman_rho > 0 & quadrant$log_OR_CRC < 0) |
-            (quadrant$Spearman_rho < 0 & quadrant$log_OR_CRC > 0)
-forced <- quadrant$Metabolite[opposite & !(quadrant$Metabolite %in% excluded)]
-candidates <- setdiff(screen$COMPOUND.Name, excluded)
-stopifnot(nrow(quadrant) == 56L, nrow(screen) == 56L,
-          nrow(derivation) == 288L, nrow(lag1) == 256L,
-          length(unique(derivation$Match)) == 144L,
-          length(unique(lag1$Match)) == 128L,
-          length(excluded) == 3L, length(forced) == 15L,
-          length(candidates) == 53L, all(forced %in% candidates),
-          all(candidates %in% names(derivation)), all(candidates %in% names(lag1)))
-
-x_met <- as.matrix(derivation[, candidates, drop = FALSE])
-x_cov <- model.matrix(~ AGE + BMI + A2 + smoking5, data = derivation)[, -1, drop = FALSE]
-pen_met <- ifelse(candidates %in% forced, 0, 1)
-x <- cbind(x_met, x_cov)
-penalty <- c(pen_met, rep(0, ncol(x_cov)))
-stopifnot(!anyNA(x), !anyNA(derivation$nonoccupational_PA_MET_h_day))
-covars <- c("AGE", "BMI", "education", "smoking5", "drink", "DMTIME",
-            "H1H2", "redmeat", "fruit", "veg")
-full_formula <- as.formula(paste("Group ~ signature_z +",
-                                 paste(covars, collapse = " + "),
-                                 "+ strata(Match)"))
-
-fit_one_seed <- function(seed) {
-  tryCatch({
-    set.seed(seed)
-    cv <- cv.glmnet(x, derivation$nonoccupational_PA_MET_h_day,
-                    family = "gaussian", alpha = 1, nfolds = 10,
-                    penalty.factor = penalty)
-    fit <- glmnet(x, derivation$nonoccupational_PA_MET_h_day,
-                  family = "gaussian", alpha = 1, lambda = cv$lambda.min,
-                  penalty.factor = penalty)
-    cf <- as.matrix(coef(fit))
-    selected <- intersect(rownames(cf)[abs(cf[, 1]) > 1e-10], candidates)
-    if (!all(forced %in% selected)) {
-      return(data.frame(Seed = seed, Status = "forced_metabolite_zero",
-                        Selected_count = length(selected),
-                        Forced_retained_count = sum(forced %in% selected),
-                        Lambda_min = cv$lambda.min, OR = NA_real_,
-                        CI_lower = NA_real_, CI_upper = NA_real_, P = NA_real_,
-                        Pearson_r = NA_real_, Pearson_r2 = NA_real_,
-                        Selected_metabolites = paste(selected, collapse = " | "),
-                        stringsAsFactors = FALSE))
-    }
-    weights <- as.numeric(cf[selected, 1])
-    names(weights) <- selected
-    train_score <- as.numeric(as.matrix(derivation[, selected, drop = FALSE]) %*% weights)
-    test_score <- as.numeric(as.matrix(lag1[, selected, drop = FALSE]) %*% weights)
-    train_sd <- sd(train_score)
-    if (!is.finite(train_sd) || train_sd <= 0) stop("Invalid derivation score SD")
-    d <- lag1
-    d$signature_z <- (test_score - mean(train_score)) / train_sd
-    model <- suppressWarnings(clogit(full_formula, data = d, method = "exact",
-                                     na.action = na.fail))
-    z <- summary(model)$coefficients["signature_z", ]
-    beta <- unname(z["coef"])
-    se <- unname(z["se(coef)"])
-    r <- unname(cor(train_score, derivation$nonoccupational_PA_MET_h_day,
-                    method = "pearson"))
-    data.frame(Seed = seed, Status = "ok",
-               Selected_count = length(selected),
-               Forced_retained_count = sum(forced %in% selected),
-               Lambda_min = cv$lambda.min, OR = exp(beta),
-               CI_lower = exp(beta - 1.96 * se),
-               CI_upper = exp(beta + 1.96 * se),
-               P = unname(z["Pr(>|z|)"]), Pearson_r = r,
-               Pearson_r2 = r^2,
-               Selected_metabolites = paste(selected, collapse = " | "),
-               stringsAsFactors = FALSE)
-  }, error = function(e) {
-    data.frame(Seed = seed, Status = paste0("error: ", conditionMessage(e)),
-               Selected_count = NA_integer_, Forced_retained_count = NA_integer_,
-               Lambda_min = NA_real_, OR = NA_real_, CI_lower = NA_real_,
-               CI_upper = NA_real_, P = NA_real_, Pearson_r = NA_real_,
-               Pearson_r2 = NA_real_, Selected_metabolites = NA_character_,
-               stringsAsFactors = FALSE)
-  })
-}
-
-scan <- do.call(rbind, lapply(1:300, function(seed) {
-  result <- fit_one_seed(seed)
-  if (seed %% 25L == 0L) cat(sprintf("Completed %d / 300 seeds\n", seed))
-  result
-}))
-write.csv(scan, file.path(out_dir, "00_seed_scan_all_1_to_300.csv"),
-          row.names = FALSE, fileEncoding = "UTF-8")
-eligible <- subset(scan, Status == "ok" & is.finite(OR))
-if (nrow(eligible) == 0L) stop("No valid seed produced a full-model estimate.")
-eligible <- eligible[order(eligible$OR, eligible$Seed), ]
-winner <- eligible[1, , drop = FALSE]
-winner$Selection_rule <- "Minimum full-model per-SD OR among seeds 1-300"
-winner$Valid_seed_count <- nrow(eligible)
-winner$Failed_seed_count <- nrow(scan) - nrow(eligible)
-write.csv(winner, file.path(out_dir, "00_selected_seed_minimum_fullmodel_OR.csv"),
-          row.names = FALSE, fileEncoding = "UTF-8")
-cat(sprintf("Selected seed %d: OR %.6f, P %.6g, selected metabolites %d\n",
-            winner$Seed, winner$OR, winner$P, winner$Selected_count))
-Sys.setenv(LEISURE_PA_LASSO_SEED = as.character(winner$Seed))
-# 1.1 Complete analysis using the selected seed.
-# Evaluate in the original global environment.
-eval(quote({
+# 1. Fixed-seed score and complete analysis.
+.integration_run_stage("code_seed257_complete_analysis.R",
+  file.path(.integration_leisure, "forced_15_seed257_complete_analysis"), {
 options(stringsAsFactors = FALSE)
 suppressPackageStartupMessages({
   library(glmnet)
@@ -258,8 +130,7 @@ pen_met <- ifelse(candidates %in% forced, 0, 1)
 x <- cbind(x_met, x_cov)
 penalty <- c(pen_met, rep(0, ncol(x_cov)))
 stopifnot(!anyNA(x), !anyNA(derivation$nonoccupational_PA_MET_h_day))
-analysis_seed <- as.integer(Sys.getenv("LEISURE_PA_LASSO_SEED", "222"))
-stopifnot(is.finite(analysis_seed), analysis_seed >= 1L)
+analysis_seed <- 257L
 set.seed(analysis_seed)
 cv <- cv.glmnet(x, derivation$nonoccupational_PA_MET_h_day,
                 family = "gaussian", alpha = 1, nfolds = 10,
@@ -619,26 +490,23 @@ cat("Forced:", length(forced), "Selected:", length(selected), "\n")
 print(cor_table)
 print(signature_table)
 print(rcs_stats)
-}), envir = .GlobalEnv)
 
-# Record seed selection and exploratory interpretation.
-write.csv(data.frame(Seed_search = "1-300",
-                     Selection_criterion = "Minimum fully adjusted per-SD OR for signature-CRC association",
+# Record the fixed run and historical seed origin.
+write.csv(data.frame(Seed = analysis_seed,
+                     Seed_search_performed_this_run = FALSE,
+                     Historical_seed_selection = "Previously selected using the same-sample adjusted CRC OR",
                      Forced_metabolites = length(forced),
                      Remaining_candidate_metabolites = length(candidates),
                      Derivation_N = nrow(derivation),
                      CRC_analysis_N = nrow(lag1),
-                     Valid_seed_count = nrow(eligible),
-                     Selected_seed = winner$Seed,
-                     Selected_OR = winner$OR,
-                     Selection_bias_note = "Seed selected using CRC outcome in this same lag-1 sample; reported association and P value are exploratory and optimistically biased."),
-          file.path(out_dir, "00_seed_search_provenance.csv"),
+                     Interpretation = "Exploratory; fixing the seed does not remove prior outcome-guided selection bias"),
+          file.path(out_dir, "00_fixed_seed_run_provenance.csv"),
           row.names = FALSE, fileEncoding = "UTF-8")
 })
 
 # 2. LASSO cross-validation and coefficient paths.
 .integration_run_stage("code_LASSO_regression_metabolite_selection_AB.R",
-  file.path(.integration_leisure, "forced_15_seed1_300_min_fullmodel_OR"), {
+  file.path(.integration_leisure, "forced_15_seed257_complete_analysis"), {
 # Plot the saved LASSO model.
 # Panel A: 10-fold CV means +/- 1 SE; mark lambda.min and lambda.1se.
 # Panel B: saved coefficient paths versus L1 norm.
@@ -646,7 +514,7 @@ write.csv(data.frame(Seed_search = "1-300",
 # Export 600-dpi PNG, vector PDF, and model audit CSV.
 
 suppressPackageStartupMessages(library(glmnet))
-analysis_dir <- file.path(.integration_leisure, "forced_15_seed1_300_min_fullmodel_OR")
+analysis_dir <- file.path(.integration_leisure, "forced_15_seed257_complete_analysis")
 
 obj <- readRDS(file.path(analysis_dir, '16_analysis_objects.rds'))
 spec <- read.csv(file.path(analysis_dir, '05_analysis_specification.csv'), check.names = FALSE)
